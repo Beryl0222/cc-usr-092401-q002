@@ -127,8 +127,9 @@ def build_handler(app):
                     elif rest == ["consent", "revoke"]:
                         result = app.revoke_consent(incident_id, body.get("scopes", []), actor)
                     elif rest == ["appeal"]:
-                        app.open_appeal(incident_id, body.get("reason", ""), actor)
-                        result = {"status": "申诉中"}
+                        appeal = app.open_appeal(incident_id, body.get("reason", ""), actor)
+                        result = {"status": "申诉中",
+                                  "frozen_actions": appeal.get("frozen_actions", [])}
                     elif rest == ["appeal", "resolve"]:
                         app.resolve_appeal(incident_id, body.get("decision"), actor,
                                            note=body.get("note"))

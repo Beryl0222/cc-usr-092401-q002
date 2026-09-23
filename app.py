@@ -6,10 +6,24 @@
 - 聚类只产生合并建议，须保护专员人工确认；
 - 报案/平台投诉/公开澄清按职责分离提交、分角色复核，禁止自复核；
 - 平台回调按 callback_id 幂等，重复回调不通知、不产生第二案件；
-- 申诉期间限制敏感材料扩散并阻断对外动作；授权撤回不抹除责任链。
+- 申诉期间限制敏感材料扩散并冻结对外动作；授权撤回不抹除责任链。
+
+申诉与对外动作的竞态规则（全部以账本事件固化，重启可重放）：
+- 申诉打开即把尚未执行的对外动作冻结（action_frozen），动作保留原审批依据，
+  状态显式为 frozen，不再以 approved 示人；已执行动作只留事实、不回滚；
+- 申诉驳回（dismissed）只恢复冻结时仍具备授权的动作（action_restored），
+  授权在冻结期间被撤回的动作保持冻结态、按缺权不可执行；
+- 申诉成立（upheld）不可逆地取消全部待执行动作（action_cancelled）并关闭事件；
+- 所有写事务在应用级锁内串行，执行与申诉并发时以账本 seq 决定唯一先后：
+  申诉先落账则执行必被冻结拦截，执行先落账则该动作既成事实（申诉不再取消它）；
+- 授权撤回、事件合并、进程重启均不能绕过冻结；迟到平台回执只能补充既有事实，
+  不得复活已取消动作或改变关闭结论。
 """
 
+import copy
+import functools
 import hashlib
+import threading
 from datetime import datetime, timezone, timedelta
 
 from domain import load_config
@@ -54,12 +68,30 @@ def _require(actor, allowed_roles):
         raise AppError(f"角色 {actor['role']} 无权执行该操作，允许角色：{'、'.join(allowed_roles)}", 403)
 
 
+def _transaction(method):
+    """把整个写操作包成一个事务：与其他事务互斥，事务内账本投影不会被并发观察到。"""
+
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._tx_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
+# 尚未走到终态（执行/驳回/取消）的动作原始状态
+_UNFINISHED_STATUSES = ("pending", "approved", "frozen")
+
+
 class SafeguardingApp:
     SUBMIT_ROLES = ("当事人代理", "俱乐部保护专员")
 
     def __init__(self, config=None, store_path=None):
         self.config = config or load_config()
         self.store = EventStore(store_path)
+        # 写事务级互斥：执行与申诉并发时，谁先在账本落 seq 谁为先，
+        # 另一个请求在同一把锁上看到的是已更新的投影并据此被接受或拒绝。
+        self._tx_lock = threading.RLock()
         self.reports = {}            # report_no -> 线索记录
         self.incidents = {}          # incident_id -> 事件投影
         self.actions = {}            # action_id -> 动作记录
@@ -85,6 +117,7 @@ class SafeguardingApp:
             handler(event["payload"])
 
     # ---------------------------------------------------------- 线索报送/立案
+    @_transaction
     def submit_report(self, payload, actor):
         _require(actor, self.SUBMIT_ROLES)
         severity = payload.get("severity")
@@ -392,6 +425,12 @@ class SafeguardingApp:
             "status": "pending", "reviewer": None, "reviewer_role": None,
             "review_reason": None, "reviewed_at": None,
             "executed_at": None, "result": None, "proposed_at": p["at"],
+            # 冻结轨迹：申诉打开时记录冻结前状态与当时审批依据，
+            # 恢复/取消均只追加，不抹除原审批与冻结事实。
+            "frozen_at": None, "frozen_by": None, "frozen_reason": None,
+            "frozen_from_status": None, "frozen_scopes": None,
+            "restored_at": None, "restored_from_status": None,
+            "cancelled_at": None, "cancelled_by": None, "cancel_reason": None,
         }
         inc = self.incidents.get(p["incident_id"])
         if inc:
@@ -405,6 +444,40 @@ class SafeguardingApp:
             action["reviewer_role"] = p["reviewer_role"]
             action["review_reason"] = p.get("reason")
             action["reviewed_at"] = p["at"]
+
+    def _on_action_frozen(self, p):
+        action = self.actions.get(p["action_id"])
+        if action and action["status"] in ("pending", "approved"):
+            action["frozen_from_status"] = action["status"]
+            action["frozen_scopes"] = list(p.get("required_scopes", action["required_scopes"]))
+            action["frozen_at"] = p["at"]
+            action["frozen_by"] = p.get("by")
+            action["frozen_reason"] = p.get("reason")
+            action["status"] = "frozen"
+
+    def _on_action_restored(self, p):
+        action = self.actions.get(p["action_id"])
+        if not action or action["status"] != "frozen":
+            return
+        if p.get("reinstated") is False:
+            # 驳回但授权已撤回：动作保持冻结，仅登记未恢复原因（可重放）。
+            action.setdefault("restore_denials", []).append({
+                "at": p["at"], "missing_scopes": list(p.get("missing_scopes", [])),
+                "reason": p.get("reason"),
+            })
+            return
+        # 只恢复冻结前的待执行状态；审批依据（reviewer 等）原样保留。
+        action["restored_from_status"] = action["frozen_from_status"]
+        action["restored_at"] = p["at"]
+        action["status"] = action["frozen_from_status"] or "pending"
+
+    def _on_action_cancelled(self, p):
+        action = self.actions.get(p["action_id"])
+        if action and action["status"] in ("pending", "approved", "frozen"):
+            action["status"] = "cancelled"
+            action["cancelled_at"] = p["at"]
+            action["cancelled_by"] = p.get("by")
+            action["cancel_reason"] = p.get("reason")
 
     def _on_action_executed(self, p):
         action = self.actions.get(p["action_id"])
@@ -428,6 +501,7 @@ class SafeguardingApp:
             self.callbacks[p["callback_id"]] = p["result"]
 
     # ------------------------------------------------------------- 严重度确认
+    @_transaction
     def confirm_severity(self, incident_id, severity, actor):
         _require(actor, ("俱乐部保护专员", "俱乐部值班主管"))
         inc = self._get_open_incident(incident_id)
@@ -448,6 +522,12 @@ class SafeguardingApp:
                 self._raise_escalation(incident_id, "等级经确认升至直接人身威胁")
 
     # ------------------------------------------------------------- 值班升级
+    def _notify(self, incident_id, channel, to_role, reason, at, **extra):
+        payload = {"notif_id": new_id("ntf"), "incident_id": incident_id,
+                   "channel": channel, "to_role": to_role, "reason": reason, "at": at}
+        payload.update(extra)
+        self._append("notification_sent", payload)
+
     def _raise_escalation(self, incident_id, reason):
         inc = self._get_open_incident(incident_id)
         if inc["escalation"] and inc["escalation"]["status"] == "open":
@@ -459,17 +539,11 @@ class SafeguardingApp:
             "reason": reason, "at": at,
         })
         for role in self.config.duty["通知角色"]:
-            self._append("notification_sent", {
-                "notif_id": new_id("ntf"),
-                "incident_id": incident_id,
-                "channel": "duty",
-                "to_role": role,
-                "reason": reason,
-                "escalation_id": escalation_id,
-                "at": at,
-            })
+            self._notify(incident_id, "duty", role, reason, at,
+                         escalation_id=escalation_id)
         return escalation_id
 
+    @_transaction
     def acknowledge_escalation(self, incident_id, actor):
         _require(actor, ("俱乐部值班主管",))
         inc = self._get_incident(incident_id)
@@ -480,6 +554,7 @@ class SafeguardingApp:
         })
 
     # ------------------------------------------------------------------ 证据
+    @_transaction
     def add_evidence(self, incident_id, payload, actor):
         _require(actor, self.SUBMIT_ROLES + ("平台联络员", "法务复核员"))
         inc = self._get_open_incident(incident_id)
@@ -499,6 +574,7 @@ class SafeguardingApp:
         })
         return {"evidence_id": evidence_id}
 
+    @_transaction
     def link_account(self, incident_id, payload, actor):
         _require(actor, self.SUBMIT_ROLES + ("平台联络员",))
         inc = self._get_open_incident(incident_id)
@@ -549,6 +625,7 @@ class SafeguardingApp:
                 "created_at": now_iso(),
             })
 
+    @_transaction
     def resolve_suggestion(self, suggestion_id, decision, actor, target_incident=None):
         _require(actor, ("俱乐部保护专员",))
         sugg = self.suggestions.get(suggestion_id)
@@ -566,6 +643,14 @@ class SafeguardingApp:
                 raise AppError("合并目标必须是建议涉及的事件之一")
             self._get_open_incident(merged_into)
             self._get_open_incident(source_id)
+            # 事件合并不能绕过冻结：申诉存续或尚有冻结动作时禁止合并，
+            # 避免冻结动作随事件并入主事件后脱离申诉/授权语义。
+            for candidate_id in (merged_into, source_id):
+                candidate = self.incidents[candidate_id]
+                if self._appeal_open(candidate):
+                    raise AppError(f"事件 {candidate_id} 申诉存续期间不得合并", 409)
+                if any(self.actions[a]["status"] == "frozen" for a in candidate["actions"]):
+                    raise AppError(f"事件 {candidate_id} 存在申诉冻结动作，解冻前不得合并", 409)
             self._append("incidents_merged", {
                 "survivor_id": merged_into, "merged_id": source_id,
                 "by": actor.get("name"), "at": now_iso(),
@@ -577,9 +662,10 @@ class SafeguardingApp:
         return {"status": decision, "merged_into": merged_into}
 
     # ------------------------------------------------------------------ 授权
+    @_transaction
     def grant_consent(self, incident_id, scopes, actor):
         _require(actor, ("当事人代理",))
-        self._get_incident(incident_id)
+        inc = self._get_incident(incident_id)
         unknown = set(scopes) - set(self.config.scopes)
         if unknown:
             raise AppError(f"未知授权范围：{sorted(unknown)}")
@@ -587,8 +673,29 @@ class SafeguardingApp:
             "incident_id": incident_id, "scopes": scopes,
             "by": actor.get("name"), "at": now_iso(),
         })
-        return {"scopes": self.incidents[incident_id]["consent_scopes"]}
+        # 申诉驳回后因缺权未恢复的冻结动作，在重新授权齐备时自动恢复，
+        # 原审批依据不变；申诉仍存续时绝不恢复。
+        if not self._appeal_open(inc):
+            self._recover_frozen_with_consent(inc, actor.get("name"))
+        return {"scopes": inc["consent_scopes"]}
 
+    def _recover_frozen_with_consent(self, inc, by):
+        at = now_iso()
+        for action_id in inc["actions"]:
+            action = self.actions[action_id]
+            if action["status"] != "frozen" or action["frozen_from_status"] != "approved":
+                continue
+            missing = [s for s in action["required_scopes"] if s not in inc["consent_scopes"]]
+            if missing:
+                continue
+            self._append("action_restored", {
+                "action_id": action_id, "incident_id": inc["incident_id"],
+                "reinstated": True,
+                "reason": "重新授权齐备，恢复冻结前已批准状态",
+                "by": by, "at": at,
+            })
+
+    @_transaction
     def revoke_consent(self, incident_id, scopes, actor):
         _require(actor, ("当事人代理",))
         inc = self._get_incident(incident_id)
@@ -604,6 +711,8 @@ class SafeguardingApp:
             "incident_id": incident_id, "scopes": scopes,
             "by": actor.get("name"), "at": now_iso(),
         })
+        # 授权撤回不改变冻结状态本身：冻结由申诉事件管辖。
+        # 已批准动作仅在视图层因缺权显示 blocked；冻结动作保持 frozen。
         return {"scopes": inc["consent_scopes"]}
 
     def _has_executed(self, incident_id, action_type):
@@ -614,12 +723,16 @@ class SafeguardingApp:
     # ------------------------------------------------------------------ 动作
     EXTERNAL_ACTIONS = ("platform_complaint", "police_report", "public_statement")
 
+    def _appeal_open(self, inc):
+        return bool(inc["appeal"] and inc["appeal"]["status"] == "open")
+
+    @_transaction
     def propose_action(self, incident_id, action_type, actor, params=None):
         _require(actor, self.SUBMIT_ROLES)
         inc = self._get_open_incident(incident_id)
         if action_type not in self.config.actions:
             raise AppError(f"未知处置动作：{action_type}")
-        if action_type in self.EXTERNAL_ACTIONS and inc["appeal"] and inc["appeal"]["status"] == "open":
+        if action_type in self.EXTERNAL_ACTIONS and self._appeal_open(inc):
             raise AppError("误报申诉期间不得发起新的对外动作")
         action_id = new_id("act")
         self._append("action_proposed", {
@@ -633,13 +746,14 @@ class SafeguardingApp:
         return {"action_id": action_id,
                 "required_reviewer_role": self.config.reviewer_role_for(action_type)}
 
+    @_transaction
     def review_action(self, action_id, decision, actor, reason=None):
         action = self.actions.get(action_id)
         if not action:
             raise AppError("处置动作不存在", 404)
         inc = self._get_open_incident(action["incident_id"])
         if action["status"] != "pending":
-            raise AppError(f"动作已{action['status']}，不能重复复核")
+            raise AppError(f"动作当前状态为{self._action_status_name(action['status'])}，不能复核")
         if decision not in ("approve", "reject"):
             raise AppError("decision 仅支持 approve/reject")
         if actor["role"] != action["required_reviewer_role"]:
@@ -655,18 +769,35 @@ class SafeguardingApp:
         })
         return {"action_id": action_id, "status": "approved" if decision == "approve" else "rejected"}
 
+    @staticmethod
+    def _action_status_name(status):
+        return {
+            "pending": "待复核", "approved": "已批准待执行", "frozen": "申诉冻结中",
+            "executed": "已执行", "rejected": "已驳回", "cancelled": "已取消",
+        }.get(status, status)
+
+    @_transaction
     def execute_action(self, action_id, actor):
         action = self.actions.get(action_id)
         if not action:
             raise AppError("处置动作不存在", 404)
         inc = self._get_open_incident(action["incident_id"])
+        # 顺序解释：进入事务后读到的投影即账本最新状态。
+        # 若并发申诉已先落账，动作必为 frozen，在此被拦截——绝不外发。
+        if action["status"] == "frozen":
+            raise AppError(
+                f"动作已因误报申诉冻结（{action.get('frozen_reason') or '申诉中'}），"
+                "须待法务裁定；申诉未获支持前不得执行", 409)
+        if action["status"] == "cancelled":
+            raise AppError("动作已随误报申诉成立被取消，不可执行", 409)
         if action["status"] != "approved":
             raise AppError("仅已复核通过的动作可以执行")
         missing = [s for s in action["required_scopes"] if s not in inc["consent_scopes"]]
         if missing:
             names = "、".join(self.config.scopes[s]["名称"] for s in missing)
             raise AppError(f"当事人当前授权不足，缺少：{names}；动作保持已批准待执行", 409)
-        if action["action_type"] in self.EXTERNAL_ACTIONS and inc["appeal"] and inc["appeal"]["status"] == "open":
+        if action["action_type"] in self.EXTERNAL_ACTIONS and self._appeal_open(inc):
+            # 兜底：即使动作尚未被冻结事件覆盖（理论上不会发生），申诉先手也阻断外发。
             raise AppError("误报申诉期间不得执行对外动作", 409)
 
         at = now_iso()
@@ -694,16 +825,44 @@ class SafeguardingApp:
         return {"action_id": action_id, "status": "executed", "result": result}
 
     # ------------------------------------------------------------------ 申诉
+    @_transaction
     def open_appeal(self, incident_id, reason, actor):
         _require(actor, self.SUBMIT_ROLES)
         inc = self._get_open_incident(incident_id)
         if inc["appeal"] and inc["appeal"]["status"] == "open":
             raise AppError("该事件已在申诉中")
+        at = now_iso()
         self._append("appeal_opened", {
             "incident_id": incident_id, "reason": reason,
-            "by": actor.get("name"), "at": now_iso(),
+            "by": actor.get("name"), "at": at,
         })
+        # 申诉取得先手：把所有尚未执行的对外动作立即冻结为账本事实。
+        # 原审批/复核依据（reviewer、review_reason、required_scopes）原样保留，
+        # 已执行动作不在此列——只保留事实，绝不回滚。
+        frozen = []
+        for action_id in inc["actions"]:
+            action = self.actions[action_id]
+            if (action["action_type"] in self.EXTERNAL_ACTIONS
+                    and action["status"] in ("pending", "approved")):
+                self._append("action_frozen", {
+                    "action_id": action_id, "incident_id": incident_id,
+                    "from_status": action["status"],
+                    "required_scopes": list(action["required_scopes"]),
+                    "reason": "误报申诉打开，冻结尚未执行的对外动作",
+                    "by": actor.get("name"), "at": at,
+                })
+                frozen.append(action_id)
+                # 通知该动作的复核角色：已批准动作被冻结、暂不可执行
+                self._notify(incident_id, "appeal", action["required_reviewer_role"],
+                             f"对外动作 {action['action_type']} 因误报申诉冻结", at,
+                             action_id=action_id, appeal_event="action_frozen")
+        # 通知法务：有待裁定申诉并已冻结对外动作
+        self._notify(incident_id, "appeal", "法务复核员",
+                     f"误报申诉已打开，冻结 {len(frozen)} 个对外动作，待裁定", at,
+                     appeal_event="appeal_opened", frozen_action_ids=frozen)
+        return {"status": "申诉中", "frozen_actions": frozen}
 
+    @_transaction
     def resolve_appeal(self, incident_id, decision, actor, note=None):
         _require(actor, ("法务复核员",))
         inc = self._get_incident(incident_id)
@@ -711,23 +870,84 @@ class SafeguardingApp:
             raise AppError("该事件没有待裁定的申诉")
         if decision not in ("upheld", "dismissed"):
             raise AppError("decision 仅支持 upheld（误报成立）/dismissed（申诉驳回）")
+        at = now_iso()
         self._append("appeal_resolved", {
             "incident_id": incident_id, "decision": decision,
-            "by": actor.get("name"), "at": now_iso(), "note": note,
+            "by": actor.get("name"), "at": at, "note": note,
         })
         if decision == "upheld":
+            # 申诉成立：不可逆地取消全部待执行项（含未走完复核的内部动作），
+            # 已执行/已驳回动作不动；随后关闭案件。
+            cancelled = []
+            for action_id in inc["actions"]:
+                action = self.actions[action_id]
+                if action["status"] in _UNFINISHED_STATUSES:
+                    self._append("action_cancelled", {
+                        "action_id": action_id, "incident_id": incident_id,
+                        "reason": "误报申诉成立，取消待执行动作（不回滚已完成动作）",
+                        "by": actor.get("name"), "at": at,
+                    })
+                    cancelled.append(action_id)
+                    self._notify(incident_id, "appeal", action["required_reviewer_role"],
+                                 f"对外动作 {action['action_type']} 随申诉成立被取消", at,
+                                 action_id=action_id, appeal_event="action_cancelled")
             self._append("incident_closed", {
                 "incident_id": incident_id,
                 "reason": "误报申诉成立，按误报关闭（责任链留存）",
                 "by": actor.get("name"), "at": now_iso(),
             })
+            self._notify(incident_id, "appeal", "俱乐部保护专员",
+                         f"误报申诉成立，取消 {len(cancelled)} 个待执行动作并关闭事件", at,
+                         appeal_event="appeal_upheld", cancelled_action_ids=cancelled)
+        else:
+            # 申诉驳回：只恢复仍具备授权的动作。
+            # pending（尚未复核）动作恢复待复核；approved 动作须当前授权仍在，
+            # 冻结期间授权被撤回的，保持冻结并登记未恢复原因，待重新授权后再恢复。
+            for action_id in inc["actions"]:
+                action = self.actions[action_id]
+                if action["status"] != "frozen":
+                    continue
+                missing = [s for s in action["required_scopes"]
+                           if s not in inc["consent_scopes"]]
+                if action["frozen_from_status"] == "approved" and missing:
+                    self._append("action_restored", {
+                        "action_id": action_id, "incident_id": incident_id,
+                        "reinstated": False,
+                        "missing_scopes": missing,
+                        "reason": "申诉驳回但授权已撤回，动作暂不恢复",
+                        "by": actor.get("name"), "at": at,
+                    })
+                    self._notify(incident_id, "appeal", action["required_reviewer_role"],
+                                 f"申诉驳回，但动作 {action['action_type']} 授权不足仍冻结", at,
+                                 action_id=action_id, appeal_event="restore_withheld",
+                                 missing_scopes=missing)
+                else:
+                    self._append("action_restored", {
+                        "action_id": action_id, "incident_id": incident_id,
+                        "reinstated": True,
+                        "reason": "申诉驳回，恢复冻结前状态",
+                        "by": actor.get("name"), "at": at,
+                    })
+                    self._notify(incident_id, "appeal", action["required_reviewer_role"],
+                                 f"申诉驳回，动作 {action['action_type']} 恢复可执行", at,
+                                 action_id=action_id, appeal_event="action_restored")
+            self._notify(incident_id, "appeal", "俱乐部保护专员",
+                         "误报申诉驳回，保护处置恢复", at, appeal_event="appeal_dismissed")
 
+    @_transaction
     def close_incident(self, incident_id, reason, actor):
         _require(actor, ("俱乐部保护专员", "法务复核员"))
         inc = self._get_open_incident(incident_id)
-        pending = [a for a in inc["actions"] if self.actions[a]["status"] in ("pending", "approved")]
+        # 可执行待办只计 pending/approved；冻结与已取消都不是可执行项。
+        pending = [a for a in inc["actions"]
+                   if self.actions[a]["status"] in ("pending", "approved")]
+        frozen = [a for a in inc["actions"] if self.actions[a]["status"] == "frozen"]
         if inc["escalation"] and inc["escalation"]["status"] == "open":
             raise AppError("值班升级尚未响应，不能关闭事件")
+        if inc["appeal"] and inc["appeal"]["status"] == "open":
+            raise AppError("申诉尚未裁定，不能关闭事件")
+        if frozen:
+            raise AppError(f"尚有 {len(frozen)} 个申诉冻结动作未解冻（需恢复执行或取消），不能关闭事件")
         if pending:
             raise AppError(f"尚有 {len(pending)} 个保护动作未完成，不能关闭事件")
         self._append("incident_closed", {
@@ -736,8 +956,14 @@ class SafeguardingApp:
         })
 
     # ------------------------------------------------------------------ 回调
+    @_transaction
     def platform_callback(self, payload):
-        """平台/采集回调。以 callback_id 幂等：重复回调不通知、不产生第二案件。"""
+        """平台/采集回调。以 callback_id 幂等：重复回调不通知、不产生第二案件。
+
+        迟到回执（事件已关闭或动作已取消后到达）只允许补充既有事实
+        （回执、内容状态、账号改名），既不复活已取消动作，也不改变关闭结论；
+        回调永远不会仅凭内容另立案件。
+        """
         callback_id = payload.get("callback_id")
         if not callback_id:
             raise AppError("回调必须携带 callback_id")
@@ -748,9 +974,38 @@ class SafeguardingApp:
         incident = self._resolve_callback_incident(payload)
         if incident is None:
             raise AppError("回调未匹配到既有事件，须先经当事人或授权代理报送立案", 404)
-        incident_id = incident["incident_id"]
+        # 已被合并的事件：迟到事实归集到主事件，保证主事件摘要/责任链一致。
+        # 证据/账号可能仍登记在被吸收事件上，故沿合并链在主事件及其吸收事件内查属主。
+        owner_chain = []
+        cur, seen = incident, set()
+        while cur is not None and cur["incident_id"] not in seen:
+            seen.add(cur["incident_id"])
+            owner_chain.append(cur)
+            cur = self.incidents.get(cur["merged_into"]) if cur.get("merged_into") else None
+        survivor = owner_chain[-1]
+        for absorbed_id in survivor.get("absorbed", []):
+            absorbed = self.incidents.get(absorbed_id)
+            if absorbed and absorbed not in owner_chain:
+                owner_chain.append(absorbed)
+        incident_id = survivor["incident_id"]
         at = now_iso()
         attached = []
+
+        def _find_evidence(url):
+            for candidate in owner_chain:
+                evidence = self._evidence_for(candidate, url)
+                if evidence:
+                    return candidate, evidence
+            return None, None
+
+        def _find_account(platform, account_key):
+            for candidate in owner_chain:
+                match = next((a for a in candidate["accounts"]
+                              if a["platform"] == platform
+                              and a["account_key"] == account_key), None)
+                if match:
+                    return candidate, match
+            return None, None
 
         receipt = payload.get("receipt")
         if receipt and receipt.get("receipt_id"):
@@ -764,10 +1019,12 @@ class SafeguardingApp:
             })
             attached.append("receipt")
             if receipt.get("status") == "removed":
-                evidence = self._evidence_for(incident, receipt.get("content_url"))
+                owner, evidence = _find_evidence(receipt.get("content_url"))
                 if evidence:
                     self._append("content_state_changed", {
-                        "incident_id": incident_id, "evidence_id": evidence["evidence_id"],
+                        # 写在真正持有证据的事件上；被吸收事件已在主事件责任链内。
+                        "incident_id": owner["incident_id"],
+                        "evidence_id": evidence["evidence_id"],
                         "old_state": evidence["state"], "new_state": "deleted",
                         "source": "platform_callback", "at": at,
                     })
@@ -775,14 +1032,13 @@ class SafeguardingApp:
 
         account = payload.get("account")
         if account and account.get("account_key"):
-            matched = next((a for a in incident["accounts"]
-                            if a["platform"] == account.get("platform")
-                            and a["account_key"] == account["account_key"]), None)
+            owner, matched = _find_account(
+                account.get("platform"), account["account_key"])
             if matched:
                 new_name = account.get("display_name")
                 if new_name and new_name != matched["display_name"]:
                     self._append("account_renamed", {
-                        "incident_id": incident_id,
+                        "incident_id": owner["incident_id"],
                         "platform": matched["platform"],
                         "account_key": matched["account_key"],
                         "old_name": matched["display_name"],
@@ -863,6 +1119,7 @@ class SafeguardingApp:
             return "保护中"
         return "已受理"
 
+    @_transaction
     def incident_digest(self, incident_id, as_role=None):
         """保护专员视角的统一视图：证据依据、处置决定、授权范围、待办保护动作。"""
         inc = self._get_incident(incident_id)
@@ -886,7 +1143,11 @@ class SafeguardingApp:
         } for a in inc["accounts"]]
 
         actions = [self._action_view(a, inc) for a in inc["actions"]]
+        # 冻结（申诉中/待解冻）与已取消（申诉成立）均不在可执行待办之列；
+        # blocked 为已批准但授权不足的派生展示。
         pending = [a["action_id"] for a in actions if a["status"] in ("pending", "approved", "blocked")]
+        frozen = [a["action_id"] for a in actions if a["status"] == "frozen"]
+        cancelled = [a["action_id"] for a in actions if a["status"] == "cancelled"]
 
         digest = {
             "incident_id": inc["incident_id"],
@@ -910,6 +1171,8 @@ class SafeguardingApp:
             ],
             "尚未完成的保护动作": {
                 "action_ids": pending,
+                "frozen_action_ids": frozen,
+                "cancelled_action_ids": cancelled,
                 "open_escalation": bool(inc["escalation"] and inc["escalation"]["status"] == "open"),
             },
             "值班升级": inc["escalation"],
@@ -932,7 +1195,26 @@ class SafeguardingApp:
             "reviewer": a["reviewer"], "review_reason": a["review_reason"],
             "executed_at": a["executed_at"], "result": a["result"],
         }
-        if a["status"] == "approved":
+        # 冻结态：显式 frozen，并保留冻结前状态与原审批/复核依据，
+        # 说明该动作为何不能手工执行、依据是什么。
+        if a["status"] == "frozen":
+            view["frozen"] = {
+                "at": a["frozen_at"], "by": a["frozen_by"],
+                "reason": a["frozen_reason"],
+                "from_status": a["frozen_from_status"],
+                "reviewer": a["reviewer"],
+                "review_reason": a["review_reason"],
+            }
+            missing = [s for s in a["required_scopes"] if s not in inc["consent_scopes"]]
+            if missing:
+                view["blocked_reason"] = "授权已撤回：" + "、".join(
+                    self.config.scopes[s]["名称"] for s in missing)
+        elif a["status"] == "cancelled":
+            view["cancelled"] = {
+                "at": a["cancelled_at"], "by": a["cancelled_by"],
+                "reason": a["cancel_reason"],
+            }
+        elif a["status"] == "approved":
             missing = [s for s in a["required_scopes"] if s not in inc["consent_scopes"]]
             if missing:
                 view["status"] = "blocked"
@@ -952,7 +1234,9 @@ class SafeguardingApp:
         for event in self.store.replay():
             p = event["payload"]
             if p.get("incident_id") in incident_ids or p.get("report_no") in wanted:
-                chain.append({"seq": event["seq"], "type": event["type"], "payload": p})
+                # 拷贝后再脱敏，绝不在账本原始事件上改写（账本只追加、不可变）。
+                chain.append({"seq": event["seq"], "type": event["type"],
+                              "payload": copy.deepcopy(p)})
         if mask:
             for item in chain:
                 p = item["payload"]
@@ -963,6 +1247,7 @@ class SafeguardingApp:
                     p["linked_accounts"] = ["【申诉期间已限制】" for _ in p["linked_accounts"]]
         return chain
 
+    @_transaction
     def list_incidents(self, status=None, severity=None):
         out = []
         for incident_id, inc in self.incidents.items():
@@ -980,12 +1265,15 @@ class SafeguardingApp:
             })
         return out
 
+    @_transaction
     def list_suggestions(self, status="open"):
-        return [s for s in self.suggestions.values() if status is None or s["status"] == status]
+        return [dict(s) for s in self.suggestions.values() if status is None or s["status"] == status]
 
+    @_transaction
     def list_reports(self):
         return list(self.reports.values())
 
+    @_transaction
     def list_notifications(self, incident_id=None):
         if incident_id:
             return [n for n in self.notifications if n["incident_id"] == incident_id]

@@ -15,6 +15,11 @@ def new_id(prefix):
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
+# 账本级串行锁：seq 分配、落盘与监听通知必须在同一临界区完成，
+# 否则并发写入可能交叉触发监听（业务层据此判定先后顺序）。
+_LEDGER_LOCK = threading.RLock()
+
+
 class EventStore:
     """线程安全的追加式账本；path 为 None 时仅驻留内存（测试用）。"""
 
@@ -38,24 +43,25 @@ class EventStore:
 
     def append(self, event_type, payload, event_id=None):
         """追加事件。event_id 已存在时返回既有事件（账本层幂等）。"""
-        with self._lock:
-            if event_id:
-                for existing in self.events:
-                    if existing["event_id"] == event_id:
-                        return existing, True
-            event = {
-                "event_id": event_id or new_id("evt"),
-                "seq": len(self.events) + 1,
-                "type": event_type,
-                "payload": payload,
-            }
-            self.events.append(event)
-            if self.path:
-                with open(self.path, "a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(event, ensure_ascii=False) + "\n")
-            for listener in list(self._listeners):
-                listener(event)
-            return event, False
+        with _LEDGER_LOCK:
+            with self._lock:
+                if event_id:
+                    for existing in self.events:
+                        if existing["event_id"] == event_id:
+                            return existing, True
+                event = {
+                    "event_id": event_id or new_id("evt"),
+                    "seq": len(self.events) + 1,
+                    "type": event_type,
+                    "payload": payload,
+                }
+                self.events.append(event)
+                if self.path:
+                    with open(self.path, "a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+                for listener in list(self._listeners):
+                    listener(event)
+                return event, False
 
     def replay(self):
         with self._lock:
