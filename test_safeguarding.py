@@ -327,6 +327,238 @@ class AppealTest(unittest.TestCase):
                          "https://video.example/comment/55")
 
 
+class AppealActionRaceTest(unittest.TestCase):
+    """申诉与对外动作竞态：冻结/恢复/取消、并发顺序、合并、重放、迟到回执。"""
+
+    def setUp(self):
+        self.app = SafeguardingApp()
+        self.incident_id = self.app.submit_report(abuse_report(), AGENT)["incident_id"]
+
+    def _approved_complaint(self):
+        action_id = self.app.propose_action(
+            self.incident_id, "platform_complaint", AGENT)["action_id"]
+        self.app.review_action(action_id, "approve", LIASON, reason="材料齐备，准予投诉")
+        return action_id
+
+    def _action(self, action_id):
+        return next(a for a in self.app.incident_digest(self.incident_id)["处置决定"]
+                    if a["action_id"] == action_id)
+
+    def test_open_appeal_freezes_pending_external_actions_keeping_approval_basis(self):
+        approved = self._approved_complaint()
+        pending = self.app.propose_action(
+            self.incident_id, "public_statement", AGENT)["action_id"]
+
+        result = self.app.open_appeal(self.incident_id, "当事人称账号被盗", AGENT)
+        self.assertEqual(result["status"], "申诉中")
+        self.assertIn(approved, result["frozen_actions"])
+        self.assertIn(pending, result["frozen_actions"])
+
+        digest = self.app.incident_digest(self.incident_id)
+        self.assertEqual(digest["status"], "申诉中")
+        view = self._action(approved)
+        # 状态显式冻结，但底层仍是已批准，审批人/理由/时间原样保留
+        self.assertEqual(view["status"], "frozen")
+        self.assertEqual(view["underlying_status"], "approved")
+        self.assertEqual(view["reviewer"], LIASON["name"])
+        self.assertEqual(view["review_reason"], "材料齐备，准予投诉")
+        self.assertIsNotNone(view["reviewed_at"])
+        self.assertTrue(view["frozen_reason"])
+        # 冻结动作进入独立清单，不再算可执行待办
+        todo = digest["尚未完成的保护动作"]
+        self.assertEqual(todo["action_ids"], [])
+        self.assertEqual(set(todo["frozen_action_ids"]), {approved, pending})
+        # 冻结不产生任何对外通知
+        self.assertEqual(self.app.list_notifications(self.incident_id), [])
+
+        # 冻结期间：已批准的不能执行，待复核的不能复核，都不得外发
+        with self.assertRaises(AppError) as ctx:
+            self.app.execute_action(approved, LIASON)
+        self.assertEqual(ctx.exception.status, 409)
+        with self.assertRaises(AppError) as ctx:
+            self.app.review_action(pending, "approve", LEGAL)
+        self.assertEqual(ctx.exception.status, 409)
+
+    def test_dismissed_appeal_restores_only_authorized_actions(self):
+        action_id = self._approved_complaint()
+        self.app.open_appeal(self.incident_id, "误认", AGENT)
+        result = self.app.resolve_appeal(self.incident_id, "dismissed", LEGAL)
+        # 授权仍在：恢复为已批准可执行
+        self.assertEqual(result["restored"], [action_id])
+        self.assertEqual(result["still_blocked"], [])
+        self.assertEqual(self._action(action_id)["status"], "approved")
+        self.assertEqual(self.app.execute_action(action_id, LIASON)["status"], "executed")
+
+    def test_dismissed_appeal_keeps_revoked_action_blocked_until_reauthorized(self):
+        action_id = self._approved_complaint()
+        self.app.open_appeal(self.incident_id, "误认", AGENT)
+        # 申诉期间撤回平台投诉授权（证据留存授权仍受保护，撤回会被拒）
+        self.app.revoke_consent(self.incident_id, ["platform_complaint"], AGENT)
+        result = self.app.resolve_appeal(self.incident_id, "dismissed", LEGAL)
+        self.assertEqual(result["restored"], [])
+        self.assertEqual(result["still_blocked"], [action_id])
+        # 解冻但授权缺失：视图 blocked，执行仍被拒
+        view = self._action(action_id)
+        self.assertEqual(view["status"], "blocked")
+        self.assertIn("授权已撤回", view["blocked_reason"])
+        with self.assertRaises(AppError) as ctx:
+            self.app.execute_action(action_id, LIASON)
+        self.assertEqual(ctx.exception.status, 409)
+        # 重新授权后恢复可执行，不需要重新审批
+        self.app.grant_consent(self.incident_id, ["platform_complaint"], AGENT)
+        self.assertEqual(self.app.execute_action(action_id, LIASON)["status"], "executed")
+
+    def test_upheld_appeal_irreversibly_cancels_pending_but_keeps_executed_fact(self):
+        executed = self._approved_complaint()
+        self.app.execute_action(executed, LIASON)  # 已完成动作：只保留事实
+        approved = self._approved_complaint()
+        pending = self.app.propose_action(
+            self.incident_id, "public_statement", AGENT)["action_id"]
+        self.app.open_appeal(self.incident_id, "误认", AGENT)
+        result = self.app.resolve_appeal(self.incident_id, "upheld", LEGAL, note="证据不足")
+        self.assertEqual(set(result["cancelled"]), {approved, pending})
+
+        digest = self.app.incident_digest(self.incident_id)
+        self.assertEqual(digest["status"], "已关闭")
+        views = {a["action_id"]: a for a in digest["处置决定"]}
+        self.assertEqual(views[executed]["status"], "executed")  # 不回滚
+        self.assertIsNotNone(views[executed]["result"])
+        for aid in (approved, pending):
+            self.assertEqual(views[aid]["status"], "cancelled")  # 不可逆终态
+            self.assertTrue(views[aid]["cancel_reason"])
+        # 已取消动作不得执行、不得复核
+        with self.assertRaises(AppError) as ctx:
+            self.app.execute_action(approved, LIASON)
+        self.assertEqual(ctx.exception.status, 409)
+        with self.assertRaises(AppError):
+            self.app.review_action(pending, "approve", LEGAL)
+        # 冻结/取消清单在摘要中一致（按事件内动作顺序列出）
+        self.assertEqual(set(digest["尚未完成的保护动作"]["cancelled_action_ids"]),
+                         {approved, pending})
+
+    def test_late_platform_receipt_supplements_fact_without_changing_cancelled_or_closed(self):
+        action_id = self._approved_complaint()
+        self.app.open_appeal(self.incident_id, "误认", AGENT)
+        self.app.resolve_appeal(self.incident_id, "upheld", LEGAL)
+
+        response = self.app.platform_callback({
+            "callback_id": "CB-LATE", "incident_id": self.incident_id,
+            "receipt": {"receipt_id": "DY-LATE", "platform": "douyin", "status": "removed",
+                        "reported_at": "2026-09-20T10:00:00+08:00",
+                        "content_url": "https://video.example/comment/55"},
+        })
+        self.assertFalse(response["duplicate"])
+        self.assertIn("receipt", response["attached"])
+        # 回执与删除事实补充进既有事件，但结论不变
+        digest = self.app.incident_digest(self.incident_id)
+        self.assertEqual(digest["status"], "已关闭")
+        self.assertEqual(self._action(action_id)["status"], "cancelled")
+        self.assertEqual(len(digest["证据依据"]["platform_receipts"]), 1)
+        self.assertIn("deleted", [e["state"] for e in digest["证据依据"]["evidence"]])
+        # 迟到回调不产生通知
+        self.assertEqual(self.app.list_notifications(), [])
+
+    def test_concurrent_execute_and_appeal_has_single_explainable_order(self):
+        for _ in range(10):
+            app = SafeguardingApp()
+            inc = app.submit_report(abuse_report(), AGENT)["incident_id"]
+            action_id = app.propose_action(inc, "platform_complaint", AGENT)["action_id"]
+            app.review_action(action_id, "approve", LIASON)
+            outcomes = {}
+            barrier = threading.Barrier(2)
+
+            def run_execute():
+                barrier.wait()
+                try:
+                    app.execute_action(action_id, LIASON)
+                    outcomes["execute"] = "executed"
+                except AppError:
+                    outcomes["execute"] = "frozen"
+
+            def run_appeal():
+                barrier.wait()
+                app.open_appeal(inc, "误认", AGENT)
+                outcomes["appeal"] = "opened"
+
+            t1 = threading.Thread(target=run_execute)
+            t2 = threading.Thread(target=run_appeal)
+            t1.start(); t2.start(); t1.join(); t2.join()
+
+            action = app.actions[action_id]
+            # 唯一顺序不变量：执行成功 ⇔ 未冻结；被冻结 ⇔ 未外发
+            self.assertFalse(action["status"] == "executed" and action["frozen"])
+            if outcomes["execute"] == "executed":
+                self.assertEqual(action["status"], "executed")
+                # 执行取得先手：申诉随后打开，已执行动作只保留事实、不被冻结
+                self.assertFalse(action["frozen"])
+                self.assertEqual(app.incident_digest(inc)["status"], "申诉中")
+            else:
+                self.assertEqual(outcomes["execute"], "frozen")
+                self.assertTrue(action["frozen"])
+                self.assertEqual(action["status"], "approved")  # 审批依据保留
+
+    def test_execute_first_then_appeal_does_not_roll_back_and_blocks_further_send(self):
+        action_id = self._approved_complaint()
+        self.assertEqual(self.app.execute_action(action_id, LIASON)["status"], "executed")
+        self.app.open_appeal(self.incident_id, "申诉另有待发动作", AGENT)
+        # 已执行不回滚；申诉后新的对外动作仍被阻断
+        self.assertEqual(self._action(action_id)["status"], "executed")
+        with self.assertRaises(AppError):
+            self.app.propose_action(self.incident_id, "public_statement", AGENT)
+
+    def test_merge_cannot_bypass_open_appeal_freeze(self):
+        first = self.app.submit_report(threat_report(), AGENT)["incident_id"]
+        self.app.acknowledge_escalation(first, DUTY)
+        second = self.app.submit_report(
+            threat_report(content_url="https://weibo.example/comment/90210?mirror=1"),
+            AGENT)["incident_id"]
+        self.app.acknowledge_escalation(second, DUTY)
+        suggestion_id = self.app.list_suggestions()[0]["suggestion_id"]
+        self.app.open_appeal(first, "误认", AGENT)
+        with self.assertRaises(AppError) as ctx:
+            self.app.resolve_suggestion(
+                suggestion_id, "accept", OFFICER, target_incident=first)
+        self.assertEqual(ctx.exception.status, 409)
+        self.assertIsNone(self.app.incidents[first]["merged_into"])
+
+
+class AppealRaceReplayTest(unittest.TestCase):
+    def test_freeze_cancel_and_replay_survive_restart_and_late_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "events.jsonl")
+            app = SafeguardingApp(store_path=path)
+            inc = app.submit_report(abuse_report(), AGENT)["incident_id"]
+            frozen_act = app.propose_action(inc, "platform_complaint", AGENT)["action_id"]
+            app.review_action(frozen_act, "approve", LIASON)
+            app.open_appeal(inc, "误认", AGENT)
+
+            # 重启重放：冻结状态恢复，仍不可执行（重启不能绕过冻结）
+            reloaded = SafeguardingApp(store_path=path)
+            view = next(a for a in reloaded.incident_digest(inc)["处置决定"]
+                        if a["action_id"] == frozen_act)
+            self.assertEqual(view["status"], "frozen")
+            self.assertEqual(view["underlying_status"], "approved")
+            self.assertEqual(reloaded.incident_digest(inc)["status"], "申诉中")
+            with self.assertRaises(AppError) as ctx:
+                reloaded.execute_action(frozen_act, LIASON)
+            self.assertEqual(ctx.exception.status, 409)
+
+            reloaded.resolve_appeal(inc, "upheld", LEGAL)
+            # 再次重启：取消与关闭结论保持
+            final = SafeguardingApp(store_path=path)
+            digest = final.incident_digest(inc)
+            self.assertEqual(digest["status"], "已关闭")
+            self.assertEqual(
+                digest["处置决定"][0]["status"], "cancelled")
+            # 关闭后迟到回执：补充事实但不改结论
+            response = final.platform_callback({
+                "callback_id": "CB-REPLAY", "incident_id": inc,
+                "receipt": {"receipt_id": "DY-R", "platform": "douyin", "status": "accepted"},
+            })
+            self.assertFalse(response["duplicate"])
+            self.assertEqual(final.incident_digest(inc)["status"], "已关闭")
+
+
 class ClosureAndDigestTest(unittest.TestCase):
     def setUp(self):
         self.app = SafeguardingApp()
